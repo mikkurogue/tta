@@ -1,4 +1,5 @@
 use clap::Parser;
+use colored::*;
 use std::collections::HashMap;
 use std::path::Path;
 use swc_common::{sync::Lrc, FileName, SourceMap};
@@ -13,9 +14,10 @@ struct Cli {
     path: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FoundType {
     pub name: String,
+    pub filename: String,
     pub line: usize,
     pub is_exported: bool,
 }
@@ -25,6 +27,7 @@ impl FoundType {
         type_alias: &TsTypeAliasDecl,
         cm: &Lrc<SourceMap>,
         fm: &Lrc<swc_common::SourceFile>,
+        filename: &str,
     ) -> Self {
         let name = type_alias.id.sym.to_string();
         let line = cm
@@ -36,6 +39,7 @@ impl FoundType {
 
         Self {
             name,
+            filename: filename.to_string(),
             line,
             is_exported,
         }
@@ -57,13 +61,22 @@ fn parse_ts_code(code: &str, filename: &str, results: &mut HashMap<String, Vec<F
     );
 
     let mut parser = swc_ecma_parser::Parser::new_from(lexer);
-    let module = parser.parse_module().expect("Failed to parse module");
+    let module = match parser.parse_module() {
+        Ok(module) => module,
+        Err(err) => {
+            eprintln!("Error parsing {}: {:?}", filename, err);
+            return;
+        }
+    };
 
     let mut type_list = Vec::new();
-    extract_types(&module, &cm, &fm, &mut type_list);
+    extract_types(&module, &cm, &fm, filename, &mut type_list);
 
-    if !type_list.is_empty() {
-        results.insert(filename.to_string(), type_list);
+    for found_type in &type_list {
+        results
+            .entry(found_type.name.clone())
+            .or_insert_with(Vec::new)
+            .push(found_type.clone());
     }
 }
 
@@ -71,11 +84,12 @@ fn extract_types(
     module: &Module,
     cm: &Lrc<SourceMap>,
     fm: &Lrc<swc_common::SourceFile>,
+    filename: &str,
     list: &mut Vec<FoundType>,
 ) {
     for item in &module.body {
         if let ModuleItem::Stmt(Stmt::Decl(Decl::TsTypeAlias(type_alias))) = item {
-            list.push(FoundType::from_ast(type_alias, cm, fm));
+            list.push(FoundType::from_ast(type_alias, cm, fm, filename));
         }
     }
 }
@@ -117,12 +131,15 @@ fn main() {
 
     println!("\n Found {} files with TS types", results.len());
 
-    for (file, types) in &results {
-        println!("\n File: {}", file);
-
-        for t in types {
-            let export_status = if t.is_exported { "exported" } else { "local" };
-            println!(" - {} (line {}, {})", t.name, t.line, export_status);
+    for (type_name, types) in &results {
+        if types.len() > 1 {
+            println!(
+                "{}",
+                format!("WARNING: Type '{}' is possibly duplicated, consider removing one type for the other:", type_name).yellow()
+            );
+            for t in types {
+                println!("  - Found in {} on line {}", t.filename, t.line);
+            }
         }
     }
 }
