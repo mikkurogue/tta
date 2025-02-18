@@ -8,3 +8,4 @@ clap = { version = "4.5.29", features = ["derive"] }
 swc_common = "6.1.1"
 swc_ecma_ast = "6.1.0"
 swc_ecma_parser = "8.0.2"
+walkdir = "2.5.0"
