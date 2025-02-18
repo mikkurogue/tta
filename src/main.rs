@@ -128,18 +128,39 @@ fn main() {
         let code = std::fs::read_to_string(&path).expect("Failed to read source file");
         parse_ts_code(&code, &path, &mut results);
     }
-
-    println!("\n Found {} files with TS types", results.len());
+    println!(
+        "\n{} {} unique TS type names.",
+        "Found".green().bold(),
+        results.len()
+    );
 
     for (type_name, types) in &results {
         if types.len() > 1 {
             println!(
-                "{}",
-                format!("WARNING: Type '{}' is possibly duplicated, consider removing one type for the other:", type_name).yellow()
+                "{}\n{}",
+                "============================================"
+                    .bright_blue()
+                    .bold(),
+                format!("{} '{}':", "WARNING: Possible duplicate type", type_name)
+                    .yellow()
+                    .bold()
             );
             for t in types {
-                println!("  - Found in {} on line {}", t.filename, t.line);
+                println!(
+                    "  {} {}\n      {} {} {}",
+                    "→ Found in".cyan().bold(),
+                    t.filename,
+                    "Line:".magenta().bold(),
+                    t.line,
+                    "--------------------------------------------".bright_black()
+                );
             }
+            println!(
+                "{}",
+                "============================================"
+                    .bright_blue()
+                    .bold()
+            );
         }
     }
 }
