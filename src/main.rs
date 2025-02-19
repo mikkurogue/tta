@@ -190,6 +190,13 @@ fn find_ts_files(path: &Path) -> Vec<String> {
         .filter(|e| !e.path().to_string_lossy().contains("node_modules"))
         .filter(|e| !e.path().to_string_lossy().contains(".nx"))
         .filter(|e| !e.path().to_string_lossy().contains("dist"))
+        .filter(|e| !e.path().to_string_lossy().contains("build"))
+        .filter(|e| !e.path().to_string_lossy().contains(".github"))
+        .filter(|e| !e.path().to_string_lossy().contains(".azuredevops"))
+        .filter(|e| !e.path().to_string_lossy().contains(".vscode"))
+        .filter(|e| !e.path().to_string_lossy().contains(".git"))
+        .filter(|e| !e.path().to_string_lossy().contains(".yarn"))
+        .filter(|e| !e.path().to_string_lossy().contains(".npm"))
     // Explicitly filter out node_modules
     {
         if let Some(ext) = entry.path().extension() {
