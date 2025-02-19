@@ -1,5 +1,6 @@
 use clap::Parser;
 use colored::*;
+use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::HashMap;
 use std::path::Path;
 use swc_common::{sync::Lrc, FileName, SourceMap};
@@ -195,9 +196,20 @@ fn main() {
     let paths = find_ts_files(Path::new(&target_path));
 
     let mut results = HashMap::new();
+    let pb = ProgressBar::new(paths.len() as u64);
+
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{msg} [{bar:40.yellow}] {pos}/{len} {eta}")
+            .unwrap()
+            .progress_chars("▇▆▅▄▃▂ "),
+    );
+
     for path in paths {
         let code = std::fs::read_to_string(&path).expect("Failed to read source file");
         parse_ts_code(&code, &path, &mut results);
+
+        pb.inc(1);
     }
     println!(
         "\n{} {} unique TS type names.",
@@ -223,7 +235,7 @@ fn main() {
                             "============================================"
                                 .bright_blue()
                                 .bold(),
-                            format!(
+                          format!(
                                 "{} '{}' in '{}' declared at line {} has the same signature and body as '{}' in '{}' declared at line {}. Consider merging this to one type definition.",
                                 "CRITICAL:".red().bold(),
                                 type_name,
@@ -278,4 +290,5 @@ fn main() {
 
     println!("Warnings: {}", warning_counter);
     println!("Critical issues: {}", critical_counter);
+    pb.finish_and_clear();
 }
