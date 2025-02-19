@@ -136,7 +136,11 @@ fn parse_ts_code(code: &str, filename: &str, results: &mut HashMap<String, Vec<F
     let module = match parser.parse_module() {
         Ok(module) => module,
         Err(err) => {
-            eprintln!("Error parsing {}: {:?}", filename, err);
+            eprintln!(
+                "Error parsing {}: {:?}",
+                filename.red().bold().italic(),
+                err
+            );
             return;
         }
     };
@@ -167,27 +171,23 @@ fn extract_types(
 }
 
 fn find_ts_files(path: &Path) -> Vec<String> {
-    let mut files = Vec::new();
-    if path.is_file() {
-        if let Some(ext) = path.extension() {
+    let mut ts_files = Vec::new();
+
+    for entry in WalkDir::new(path)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| !e.path().to_string_lossy().contains("node_modules"))
+        .filter(|e| !e.path().to_string_lossy().contains(".nx"))
+    // Explicitly filter out node_modules
+    {
+        if let Some(ext) = entry.path().extension() {
             if ext == "ts" || ext == "tsx" {
-                files.push(path.to_string_lossy().into_owned());
-            }
-        }
-    } else if path.is_dir() {
-        for entry in WalkDir::new(path)
-            .into_iter()
-            .filter_map(Result::ok)
-            .filter(|e| e.path().is_file())
-        {
-            if let Some(ext) = entry.path().extension() {
-                if ext == "ts" || ext == "tsx" {
-                    files.push(entry.path().to_string_lossy().into_owned());
-                }
+                ts_files.push(entry.path().to_string_lossy().to_string());
             }
         }
     }
-    files
+
+    ts_files
 }
 
 fn main() {
