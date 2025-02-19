@@ -13,6 +13,10 @@ use walkdir::WalkDir;
 struct Cli {
     /// Path to .ts(x) file
     path: Option<String>,
+
+    /// Enable verbose logging for errors
+    #[clap(short, long)]
+    verbose: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -118,7 +122,12 @@ fn serialize_ts_type(ts_type: &TsType) -> String {
     }
 }
 
-fn parse_ts_code(code: &str, filename: &str, results: &mut HashMap<String, Vec<FoundType>>) {
+fn parse_ts_code(
+    code: &str,
+    filename: &str,
+    results: &mut HashMap<String, Vec<FoundType>>,
+    verbose: bool,
+) {
     let cm: Lrc<SourceMap> = Default::default();
     let fm = cm.new_source_file(Lrc::new(FileName::Real(filename.into())), code.into());
 
@@ -136,11 +145,13 @@ fn parse_ts_code(code: &str, filename: &str, results: &mut HashMap<String, Vec<F
     let module = match parser.parse_module() {
         Ok(module) => module,
         Err(err) => {
-            eprintln!(
-                "Error parsing {}: {:?}",
-                filename.red().bold().italic(),
-                err
-            );
+            if verbose {
+                eprintln!(
+                    "Error parsing {}: {:?}",
+                    filename.red().bold().italic(),
+                    err
+                );
+            }
             return;
         }
     };
@@ -178,6 +189,7 @@ fn find_ts_files(path: &Path) -> Vec<String> {
         .filter_map(Result::ok)
         .filter(|e| !e.path().to_string_lossy().contains("node_modules"))
         .filter(|e| !e.path().to_string_lossy().contains(".nx"))
+        .filter(|e| !e.path().to_string_lossy().contains("dist"))
     // Explicitly filter out node_modules
     {
         if let Some(ext) = entry.path().extension() {
@@ -207,7 +219,7 @@ fn main() {
 
     for path in paths {
         let code = std::fs::read_to_string(&path).expect("Failed to read source file");
-        parse_ts_code(&code, &path, &mut results);
+        parse_ts_code(&code, &path, &mut results, args.verbose);
 
         pb.inc(1);
     }
