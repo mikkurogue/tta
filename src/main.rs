@@ -187,16 +187,18 @@ fn find_ts_files(path: &Path) -> Vec<String> {
     for entry in WalkDir::new(path)
         .into_iter()
         .filter_map(Result::ok)
-        .filter(|e| !e.path().to_string_lossy().contains("node_modules"))
-        .filter(|e| !e.path().to_string_lossy().contains(".nx"))
-        .filter(|e| !e.path().to_string_lossy().contains("dist"))
-        .filter(|e| !e.path().to_string_lossy().contains("build"))
-        .filter(|e| !e.path().to_string_lossy().contains(".github"))
-        .filter(|e| !e.path().to_string_lossy().contains(".azuredevops"))
-        .filter(|e| !e.path().to_string_lossy().contains(".vscode"))
-        .filter(|e| !e.path().to_string_lossy().contains(".git"))
-        .filter(|e| !e.path().to_string_lossy().contains(".yarn"))
-        .filter(|e| !e.path().to_string_lossy().contains(".npm"))
+        .filter(|e| {
+            !e.path().to_string_lossy().contains("node_modules")
+                || !e.path().to_string_lossy().contains("dist")
+                || !e.path().to_string_lossy().contains(".nx")
+                || !e.path().to_string_lossy().contains("build")
+                || !e.path().to_string_lossy().contains(".github")
+                || !e.path().to_string_lossy().contains(".azuredevops")
+                || !e.path().to_string_lossy().contains(".vscode")
+                || !e.path().to_string_lossy().contains(".git")
+                || !e.path().to_string_lossy().contains(".yarn")
+                || !e.path().to_string_lossy().contains(".npm")
+        })
     // Explicitly filter out node_modules
     {
         if let Some(ext) = entry.path().extension() {
