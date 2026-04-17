@@ -1,4 +1,5 @@
 use oxc_ast::ast::{TSType, TSTypeAliasDeclaration};
+use oxc_span::Span;
 
 #[derive(Debug, Clone)]
 pub struct FoundType {
@@ -18,10 +19,13 @@ impl FoundType {
         source: &str,
         filename: &str,
         is_exported: bool,
+        override_span: Option<Span>,
     ) -> Self {
         let name = type_alias.id.name.to_string();
-        let start = type_alias.span.start as usize;
-        let end = type_alias.span.end as usize;
+
+        let span = override_span.unwrap_or(type_alias.span);
+        let start = span.start as usize;
+        let end = span.end as usize;
 
         // Calculate line/col from byte offset
         let (line, col) = byte_offset_to_line_col(source, start);

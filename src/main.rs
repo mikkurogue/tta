@@ -2,6 +2,7 @@ pub mod type_checker;
 
 use ariadne::{Cache, Color, Label, Report, ReportKind, Source};
 use clap::Parser;
+use ignore::WalkBuilder;
 use indicatif::{ProgressBar, ProgressStyle};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{Declaration, Statement};
@@ -11,7 +12,6 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 use type_checker::FoundType;
-use walkdir::WalkDir;
 
 #[derive(clap::Parser)]
 struct Cli {
@@ -48,7 +48,7 @@ fn parse_ts_code(
     for stmt in &program.body {
         match stmt {
             Statement::TSTypeAliasDeclaration(type_alias) => {
-                let found = FoundType::from_ast(type_alias, code, filename, false);
+                let found = FoundType::from_ast(type_alias, code, filename, false, None);
                 results
                     .entry(found.name.clone())
                     .or_insert_with(Vec::new)
@@ -56,7 +56,8 @@ fn parse_ts_code(
             }
             Statement::ExportNamedDeclaration(export) => {
                 if let Some(Declaration::TSTypeAliasDeclaration(type_alias)) = &export.declaration {
-                    let found = FoundType::from_ast(type_alias, code, filename, true);
+                    let found =
+                        FoundType::from_ast(type_alias, code, filename, true, Some(export.span));
                     results
                         .entry(found.name.clone())
                         .or_insert_with(Vec::new)
@@ -70,25 +71,13 @@ fn parse_ts_code(
 
 fn find_ts_files(path: &Path) -> Vec<String> {
     let mut ts_files = Vec::new();
-    let excluded = [
-        "node_modules",
-        "dist",
-        ".nx",
-        "build",
-        ".github",
-        ".azuredevops",
-        ".vscode",
-        ".git",
-        ".yarn",
-        ".npm",
-    ];
 
-    for entry in WalkDir::new(path)
-        .into_iter()
-        .filter_entry(|e| {
-            let name = e.file_name().to_string_lossy();
-            !excluded.iter().any(|ex| name == *ex)
-        })
+    for entry in WalkBuilder::new(path)
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .build()
         .filter_map(Result::ok)
     {
         if let Some(ext) = entry.path().extension() {
