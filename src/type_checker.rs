@@ -1,105 +1,148 @@
-use swc_common::{sync::Lrc, SourceMap};
-use swc_ecma_ast::{TsType, TsTypeAliasDecl};
+use oxc_ast::ast::{TSType, TSTypeAliasDeclaration};
 
 #[derive(Debug, Clone)]
 pub struct FoundType {
     pub name: String,
     pub filename: String,
     pub line: usize,
+    pub col: usize,
+    pub span_start: usize,
+    pub span_end: usize,
     pub is_exported: bool,
     pub body: String,
 }
 
 impl FoundType {
     pub fn from_ast(
-        type_alias: &TsTypeAliasDecl,
-        cm: &Lrc<SourceMap>,
-        fm: &Lrc<swc_common::SourceFile>,
+        type_alias: &TSTypeAliasDeclaration,
+        source: &str,
         filename: &str,
+        is_exported: bool,
     ) -> Self {
-        let name = type_alias.id.sym.to_string();
-        let line = cm
-            .lookup_line(fm.start_pos + type_alias.span.lo)
-            .map(|pos| pos.line + 1)
-            .unwrap_or(0);
+        let name = type_alias.id.name.to_string();
+        let start = type_alias.span.start as usize;
+        let end = type_alias.span.end as usize;
 
-        let is_exported = matches!(type_alias.declare, true);
+        // Calculate line/col from byte offset
+        let (line, col) = byte_offset_to_line_col(source, start);
 
-        let body = serialize_ts_type(&type_alias.type_ann);
+        let body = serialize_ts_type(&type_alias.type_annotation);
 
         Self {
             name,
             body,
             filename: filename.to_string(),
             line,
+            col,
+            span_start: start,
+            span_end: end,
             is_exported,
         }
     }
 }
 
-/// Serialize a TsType from swc to a string
-fn serialize_ts_type(ts_type: &TsType) -> String {
+fn byte_offset_to_line_col(source: &str, offset: usize) -> (usize, usize) {
+    let mut line = 1;
+    let mut col = 1;
+    for (i, ch) in source.char_indices() {
+        if i >= offset {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    (line, col)
+}
+
+fn serialize_ts_type(ts_type: &TSType) -> String {
     match ts_type {
-        TsType::TsKeywordType(keyword) => format!("KeywordType({:?})", keyword.kind),
-        TsType::TsTypeRef(type_ref) => {
-            // Handle TsEntityName (it can be TsQualifiedName or TsEntityName)
-            let type_name = match &type_ref.type_name {
-                swc_ecma_ast::TsEntityName::TsQualifiedName(qualified_name) => {
-                    format!("QualifiedName({:?})", qualified_name)
-                }
-                swc_ecma_ast::TsEntityName::Ident(ident) => {
-                    format!("Ident({})", ident.sym)
-                }
-            };
-            format!("TypeRef({}, {:?})", type_name, type_ref.type_params)
-        }
-        TsType::TsTypeLit(type_lit) => format!("TypeLit({:?})", type_lit.members),
-        TsType::TsUnionOrIntersectionType(union_or_intersection) => {
-            // Handle union or intersection types
-            match union_or_intersection {
-                swc_ecma_ast::TsUnionOrIntersectionType::TsUnionType(union_type) => {
-                    format!("UnionType({:?})", union_type.types)
-                }
-                swc_ecma_ast::TsUnionOrIntersectionType::TsIntersectionType(intersection_type) => {
-                    format!("IntersectionType({:?})", intersection_type.types)
-                }
+        TSType::TSAnyKeyword(_) => "any".to_string(),
+        TSType::TSBooleanKeyword(_) => "boolean".to_string(),
+        TSType::TSNumberKeyword(_) => "number".to_string(),
+        TSType::TSStringKeyword(_) => "string".to_string(),
+        TSType::TSNullKeyword(_) => "null".to_string(),
+        TSType::TSUndefinedKeyword(_) => "undefined".to_string(),
+        TSType::TSVoidKeyword(_) => "void".to_string(),
+        TSType::TSNeverKeyword(_) => "never".to_string(),
+        TSType::TSUnknownKeyword(_) => "unknown".to_string(),
+        TSType::TSBigIntKeyword(_) => "bigint".to_string(),
+        TSType::TSSymbolKeyword(_) => "symbol".to_string(),
+        TSType::TSObjectKeyword(_) => "object".to_string(),
+        TSType::TSIntrinsicKeyword(_) => "intrinsic".to_string(),
+        TSType::TSThisType(_) => "this".to_string(),
+
+        TSType::TSTypeReference(r) => {
+            let name = format!("{:?}", r.type_name);
+            if let Some(params) = &r.type_arguments {
+                let ps: Vec<String> = params.params.iter().map(|p| serialize_ts_type(p)).collect();
+                format!("{}<{}>", name, ps.join(", "))
+            } else {
+                name
             }
         }
-        TsType::TsArrayType(array_type) => format!("ArrayType({:?})", array_type.elem_type),
-        TsType::TsTupleType(tuple_type) => format!("TupleType({:?})", tuple_type.elem_types),
-        TsType::TsFnOrConstructorType(fn_or_constructor) => {
-            format!("FnOrConstructorType({:?})", fn_or_constructor)
+
+        TSType::TSTypeLiteral(lit) => {
+            let members: Vec<String> = lit.members.iter().map(|m| format!("{:?}", m)).collect();
+            format!("{{ {} }}", members.join("; "))
         }
-        TsType::TsConditionalType(conditional_type) => {
-            format!("ConditionalType({:?})", conditional_type)
+
+        TSType::TSUnionType(u) => {
+            let types: Vec<String> = u.types.iter().map(|t| serialize_ts_type(t)).collect();
+            types.join(" | ")
         }
-        TsType::TsTypeQuery(type_query) => {
-            // Handle TsTypeQuery
-            match &type_query.expr_name {
-                swc_ecma_ast::TsTypeQueryExpr::TsEntityName(entity_name) => {
-                    format!("TypeQuery(TsEntityName({:?}))", entity_name)
-                }
-                swc_ecma_ast::TsTypeQueryExpr::Import(import) => {
-                    format!("TypeQuery(Import({:?}))", import)
-                }
-            }
+
+        TSType::TSIntersectionType(i) => {
+            let types: Vec<String> = i.types.iter().map(|t| serialize_ts_type(t)).collect();
+            types.join(" & ")
         }
-        TsType::TsIndexedAccessType(indexed_access) => {
-            format!("IndexedAccessType({:?})", indexed_access)
+
+        TSType::TSArrayType(a) => format!("{}[]", serialize_ts_type(&a.element_type)),
+
+        TSType::TSTupleType(t) => {
+            let elems: Vec<String> = t.element_types.iter().map(|e| format!("{:?}", e)).collect();
+            format!("[{}]", elems.join(", "))
         }
-        TsType::TsMappedType(mapped_type) => format!("MappedType({:?})", mapped_type),
-        TsType::TsTypeOperator(type_operator) => format!("TypeOperator({:?})", type_operator),
-        TsType::TsImportType(import_type) => format!("ImportType({:?})", import_type),
-        TsType::TsParenthesizedType(parenthesized_type) => {
-            format!("ParenthesizedType({:?})", parenthesized_type)
+
+        TSType::TSFunctionType(f) => format!("FunctionType({:?})", f.params),
+        TSType::TSConstructorType(c) => format!("ConstructorType({:?})", c.params),
+        TSType::TSConditionalType(c) => {
+            format!(
+                "{} extends {} ? {} : {}",
+                serialize_ts_type(&c.check_type),
+                serialize_ts_type(&c.extends_type),
+                serialize_ts_type(&c.true_type),
+                serialize_ts_type(&c.false_type)
+            )
         }
-        TsType::TsInferType(infer_type) => format!("InferType({:?})", infer_type),
-        TsType::TsThisType(this_type) => format!("ThisType({:?})", this_type),
-        TsType::TsOptionalType(optional_type) => format!("OptionalType({:?})", optional_type),
-        TsType::TsRestType(rest_type) => format!("RestType({:?})", rest_type),
-        TsType::TsLitType(lit_type) => format!("LitType({:?})", lit_type),
-        TsType::TsTypePredicate(type_predicate) => {
-            format!("TypePredicate({:?})", type_predicate)
+        TSType::TSTypeQuery(q) => format!("typeof {:?}", q.expr_name),
+        TSType::TSIndexedAccessType(i) => {
+            format!(
+                "{}[{}]",
+                serialize_ts_type(&i.object_type),
+                serialize_ts_type(&i.index_type)
+            )
         }
+        TSType::TSMappedType(m) => format!("MappedType({:?})", m.key),
+        TSType::TSTypeOperatorType(o) => {
+            format!("{:?} {}", o.operator, serialize_ts_type(&o.type_annotation))
+        }
+        TSType::TSImportType(i) => format!("import({:?})", i.source),
+        TSType::TSParenthesizedType(p) => {
+            format!("({})", serialize_ts_type(&p.type_annotation))
+        }
+        TSType::TSInferType(i) => format!("infer {:?}", i.type_parameter),
+        TSType::TSLiteralType(l) => format!("{:?}", l.literal),
+        TSType::TSTemplateLiteralType(t) => format!("TemplateLiteral({:?})", t.quasis),
+        TSType::TSNamedTupleMember(m) => {
+            format!("{}: {:?}", m.label, m.element_type)
+        }
+        TSType::JSDocNullableType(n) => format!("?{}", serialize_ts_type(&n.type_annotation)),
+        TSType::JSDocNonNullableType(n) => format!("!{}", serialize_ts_type(&n.type_annotation)),
+        TSType::JSDocUnknownType(_) => "unknown(jsdoc)".to_string(),
+        TSType::TSTypePredicate(p) => format!("TypePredicate({:?})", p.parameter_name),
     }
 }

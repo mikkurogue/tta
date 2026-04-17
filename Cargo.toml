@@ -1,15 +1,16 @@
 [package]
 name = "tta"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2021"
 
 [dependencies]
+ariadne = "0.6.0"
 clap = { version = "4.5.29", features = ["derive"] }
-colored = "3.0.0"
-indicatif = "0.17.11"
+indicatif = "0.18.4"
+oxc_allocator = "0.126.0"
+oxc_parser = "0.126.0"
+oxc_ast = "0.126.0"
+oxc_span = "0.126.0"
 serde = { version = "1.0.217", features = ["derive"] }
 serde_json = "1.0.138"
-swc_common = "6.1.1"
-swc_ecma_ast = "6.1.0"
-swc_ecma_parser = "8.0.2"
 walkdir = "2.5.0"

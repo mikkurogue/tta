@@ -1,25 +1,30 @@
 pub mod type_checker;
 
+use ariadne::{Cache, Color, Label, Report, ReportKind, Source};
 use clap::Parser;
-use colored::*;
 use indicatif::{ProgressBar, ProgressStyle};
+use oxc_allocator::Allocator;
+use oxc_ast::ast::{Declaration, Statement};
+use oxc_parser::Parser as OxcParser;
+use oxc_span::SourceType;
 use std::collections::HashMap;
+use std::fmt;
 use std::path::Path;
-use swc_common::{sync::Lrc, FileName, SourceMap};
-use swc_ecma_ast::{Decl, Module, ModuleItem, Stmt};
-use swc_ecma_parser::TsSyntax;
-use swc_ecma_parser::{lexer::Lexer, StringInput, Syntax};
 use type_checker::FoundType;
 use walkdir::WalkDir;
 
 #[derive(clap::Parser)]
 struct Cli {
-    /// Path to .ts(x) file
+    /// Path to .ts(x) file or directory
     path: Option<String>,
 
-    /// Enable verbose logging for errors
+    /// Enable verbose logging for parse errors
     #[clap(short, long)]
     verbose: bool,
+
+    /// Ignore warnings (only show critical/error diagnostics)
+    #[clap(long)]
+    ignore_warnings: bool,
 }
 
 fn parse_ts_code(
@@ -28,78 +33,63 @@ fn parse_ts_code(
     results: &mut HashMap<String, Vec<FoundType>>,
     verbose: bool,
 ) {
-    let cm: Lrc<SourceMap> = Default::default();
-    let fm = cm.new_source_file(Lrc::new(FileName::Real(filename.into())), code.into());
+    let allocator = Allocator::default();
+    let source_type = SourceType::from_path(filename).unwrap_or_default();
+    let parser_return = OxcParser::new(&allocator, code, source_type).parse();
 
-    let lexer = Lexer::new(
-        Syntax::Typescript(TsSyntax {
-            tsx: true,
-            ..Default::default()
-        }),
-        Default::default(),
-        StringInput::from(&*fm),
-        None,
-    );
-
-    let mut parser = swc_ecma_parser::Parser::new_from(lexer);
-    let module = match parser.parse_module() {
-        Ok(module) => module,
-        Err(err) => {
-            if verbose {
-                eprintln!(
-                    "Error parsing {}: {:?}",
-                    filename.red().bold().italic(),
-                    err
-                );
-            }
-            return;
+    if !parser_return.errors.is_empty() && verbose {
+        for error in &parser_return.errors {
+            eprintln!("Parse error in {}: {}", filename, error);
         }
-    };
-
-    let mut type_list = Vec::new();
-    extract_types(&module, &cm, &fm, filename, &mut type_list);
-
-    for found_type in &type_list {
-        results
-            .entry(found_type.name.clone())
-            .or_insert_with(Vec::new)
-            .push(found_type.clone());
     }
-}
 
-fn extract_types(
-    module: &Module,
-    cm: &Lrc<SourceMap>,
-    fm: &Lrc<swc_common::SourceFile>,
-    filename: &str,
-    list: &mut Vec<FoundType>,
-) {
-    for item in &module.body {
-        if let ModuleItem::Stmt(Stmt::Decl(Decl::TsTypeAlias(type_alias))) = item {
-            list.push(FoundType::from_ast(type_alias, cm, fm, filename));
+    let program = parser_return.program;
+
+    for stmt in &program.body {
+        match stmt {
+            Statement::TSTypeAliasDeclaration(type_alias) => {
+                let found = FoundType::from_ast(type_alias, code, filename, false);
+                results
+                    .entry(found.name.clone())
+                    .or_insert_with(Vec::new)
+                    .push(found);
+            }
+            Statement::ExportNamedDeclaration(export) => {
+                if let Some(Declaration::TSTypeAliasDeclaration(type_alias)) = &export.declaration {
+                    let found = FoundType::from_ast(type_alias, code, filename, true);
+                    results
+                        .entry(found.name.clone())
+                        .or_insert_with(Vec::new)
+                        .push(found);
+                }
+            }
+            _ => {}
         }
     }
 }
 
 fn find_ts_files(path: &Path) -> Vec<String> {
     let mut ts_files = Vec::new();
+    let excluded = [
+        "node_modules",
+        "dist",
+        ".nx",
+        "build",
+        ".github",
+        ".azuredevops",
+        ".vscode",
+        ".git",
+        ".yarn",
+        ".npm",
+    ];
 
     for entry in WalkDir::new(path)
         .into_iter()
-        .filter_map(Result::ok)
-        .filter(|e| {
-            !e.path().to_string_lossy().contains("node_modules")
-                || !e.path().to_string_lossy().contains("dist")
-                || !e.path().to_string_lossy().contains(".nx")
-                || !e.path().to_string_lossy().contains("build")
-                || !e.path().to_string_lossy().contains(".github")
-                || !e.path().to_string_lossy().contains(".azuredevops")
-                || !e.path().to_string_lossy().contains(".vscode")
-                || !e.path().to_string_lossy().contains(".git")
-                || !e.path().to_string_lossy().contains(".yarn")
-                || !e.path().to_string_lossy().contains(".npm")
+        .filter_entry(|e| {
+            let name = e.file_name().to_string_lossy();
+            !excluded.iter().any(|ex| name == *ex)
         })
-    // Explicitly filter out node_modules
+        .filter_map(Result::ok)
     {
         if let Some(ext) = entry.path().extension() {
             if ext == "ts" || ext == "tsx" {
@@ -111,14 +101,47 @@ fn find_ts_files(path: &Path) -> Vec<String> {
     ts_files
 }
 
+/// Multi-file source cache for ariadne
+struct FileCache {
+    files: HashMap<String, Source<String>>,
+}
+
+impl FileCache {
+    fn new() -> Self {
+        Self {
+            files: HashMap::new(),
+        }
+    }
+
+    fn insert(&mut self, filename: String, source: String) {
+        self.files.insert(filename, Source::from(source));
+    }
+}
+
+#[allow(refining_impl_trait)]
+impl Cache<String> for &FileCache {
+    type Storage = String;
+
+    fn fetch(&mut self, id: &String) -> Result<&Source<String>, Box<dyn fmt::Debug + '_>> {
+        self.files
+            .get(id)
+            .ok_or_else(|| Box::new(format!("Unknown file: {}", id)) as Box<dyn fmt::Debug>)
+    }
+
+    fn display<'a>(&self, id: &'a String) -> Option<Box<dyn fmt::Display + 'a>> {
+        Some(Box::new(id.clone()))
+    }
+}
+
 fn main() {
     let args = Cli::parse();
     let target_path = args.path.unwrap_or_else(|| ".".to_string());
     let paths = find_ts_files(Path::new(&target_path));
 
-    let mut results = HashMap::new();
-    let pb = ProgressBar::new(paths.len() as u64);
+    let mut results: HashMap<String, Vec<FoundType>> = HashMap::new();
+    let mut source_cache = FileCache::new();
 
+    let pb = ProgressBar::new(paths.len() as u64);
     pb.set_style(
         ProgressStyle::default_bar()
             .template("{msg} [{bar:40.yellow}] {pos}/{len} {eta}")
@@ -126,90 +149,92 @@ fn main() {
             .progress_chars("▇▆▅▄▃▂ "),
     );
 
-    for path in paths {
-        let code = std::fs::read_to_string(&path).expect("Failed to read source file");
-        parse_ts_code(&code, &path, &mut results, args.verbose);
-
+    for path in &paths {
+        let code = std::fs::read_to_string(path).expect("Failed to read source file");
+        source_cache.insert(path.clone(), code.clone());
+        parse_ts_code(&code, path, &mut results, args.verbose);
         pb.inc(1);
     }
-    println!(
-        "\n{} {} unique TS type names.",
-        "Found".green().bold(),
-        results.len()
-    );
+    pb.finish_and_clear();
 
-    let mut warning_counter: usize = 0;
-    let mut critical_counter: usize = 0;
+    eprintln!("Found {} unique TS type names.\n", results.len());
 
-    // Compare bodies of duplicate types
+    let mut warning_count: usize = 0;
+    let mut critical_count: usize = 0;
+
     for (type_name, types) in &results {
-        if types.len() > 1 {
-            // Compare each type with every other type
-            for i in 0..types.len() {
-                for j in (i + 1)..types.len() {
-                    let type_a = &types[i];
-                    let type_b = &types[j];
+        if types.len() <= 1 {
+            continue;
+        }
 
-                    if type_a.body == type_b.body {
-                        println!(
-                            "{}\n{}",
-                            "============================================"
-                                .bright_blue()
-                                .bold(),
-                          format!(
-                                "{} '{}' in '{}' declared at line {} has the same signature and body as '{}' in '{}' declared at line {}. Consider merging this to one type definition.",
-                                "CRITICAL:".red().bold(),
-                                type_name,
-                                type_a.filename,
-                                type_a.line,
-                                type_name,
-                                type_b.filename,
-                                type_b.line
-                            )
-                            .red()
-                            .bold()
-                        );
-                        println!(
-                            "{}",
-                            "============================================"
-                                .bright_blue()
-                                .bold()
-                        );
-                        critical_counter += 1;
-                    } else {
-                        println!(
-                            "{}\n{}",
-                            "============================================"
-                                .bright_blue()
-                                .bold(),
-                            format!(
-                                "{} '{}' in '{}' declared at line {} has the same name but a different body as '{}' in '{}' declared at line {}.",
-                                "WARNING:".yellow().bold(),
-                                type_name,
-                                type_a.filename,
-                                type_a.line,
-                                type_name,
-                                type_b.filename,
-                                type_b.line
-                            )
-                            .yellow()
-                            .bold()
-                        );
-                        println!(
-                            "{}",
-                            "============================================"
-                                .bright_blue()
-                                .bold()
-                        );
+        for i in 0..types.len() {
+            for j in (i + 1)..types.len() {
+                let type_a = &types[i];
+                let type_b = &types[j];
 
-                        warning_counter += 1
-                    }
+                let is_critical = type_a.body == type_b.body;
+
+                if !is_critical && args.ignore_warnings {
+                    continue;
+                }
+
+                if is_critical {
+                    critical_count += 1;
+
+                    Report::build(
+                        ReportKind::Error,
+                        (type_a.filename.clone(), type_a.span_start..type_a.span_end),
+                    )
+                    .with_message(format!(
+                        "Duplicate type '{}' with identical body",
+                        type_name
+                    ))
+                    .with_label(
+                        Label::new((type_a.filename.clone(), type_a.span_start..type_a.span_end))
+                            .with_message("first defined here")
+                            .with_color(Color::Red),
+                    )
+                    .with_label(
+                        Label::new((type_b.filename.clone(), type_b.span_start..type_b.span_end))
+                            .with_message("also defined here with the same body")
+                            .with_color(Color::Red),
+                    )
+                    .with_note("Consider merging into a single shared type definition.")
+                    .finish()
+                    .eprint(&source_cache)
+                    .unwrap();
+                } else {
+                    warning_count += 1;
+
+                    Report::build(
+                        ReportKind::Warning,
+                        (type_a.filename.clone(), type_a.span_start..type_a.span_end),
+                    )
+                    .with_message(format!(
+                        "Duplicate type name '{}' with different body",
+                        type_name
+                    ))
+                    .with_label(
+                        Label::new((type_a.filename.clone(), type_a.span_start..type_a.span_end))
+                            .with_message("defined here")
+                            .with_color(Color::Yellow),
+                    )
+                    .with_label(
+                        Label::new((type_b.filename.clone(), type_b.span_start..type_b.span_end))
+                            .with_message("also defined here with a different body")
+                            .with_color(Color::Yellow),
+                    )
+                    .with_help(
+                        "These types share a name but differ in structure. Consider renaming one.",
+                    )
+                    .finish()
+                    .eprint(&source_cache)
+                    .unwrap();
                 }
             }
         }
     }
 
-    println!("Warnings: {}", warning_counter);
-    println!("Critical issues: {}", critical_counter);
-    pb.finish_and_clear();
+    eprintln!("\nWarnings: {}", warning_count);
+    eprintln!("Critical: {}", critical_count);
 }
