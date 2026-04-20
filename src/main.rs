@@ -1,17 +1,22 @@
+pub mod interface_checker;
+pub mod shared_lib;
 pub mod type_checker;
 
 use ariadne::{Cache, Color, Label, Report, ReportKind, Source};
 use clap::Parser;
 use ignore::WalkBuilder;
 use indicatif::{ProgressBar, ProgressStyle};
-use oxc_allocator::Allocator;
-use oxc_ast::ast::{Declaration, Statement};
-use oxc_parser::Parser as OxcParser;
-use oxc_span::SourceType;
+use oxc::allocator::Allocator;
+use oxc::ast::ast::{Declaration, Statement, TSTypeName};
+use oxc::parser::Parser as OxcParser;
+use oxc::span::SourceType;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
-use type_checker::FoundType;
+
+use crate::interface_checker::InterfaceChecker;
+use crate::shared_lib::{DeclarationChecker, FoundDeclarationNode};
+use crate::type_checker::TypeChecker;
 
 #[derive(clap::Parser)]
 struct Cli {
@@ -30,7 +35,8 @@ struct Cli {
 fn parse_ts_code(
     code: &str,
     filename: &str,
-    results: &mut HashMap<String, Vec<FoundType>>,
+    results: &mut HashMap<String, Vec<FoundDeclarationNode>>,
+    impl_counts: &mut HashMap<String, usize>,
     verbose: bool,
 ) {
     let allocator = Allocator::default();
@@ -48,20 +54,56 @@ fn parse_ts_code(
     for stmt in &program.body {
         match stmt {
             Statement::TSTypeAliasDeclaration(type_alias) => {
-                let found = FoundType::from_ast(type_alias, code, filename, false, None);
+                let checker = TypeChecker { type_alias };
+                let found = checker.from_ast(code, filename, false, None);
                 results
                     .entry(found.name.clone())
                     .or_insert_with(Vec::new)
                     .push(found);
             }
+            Statement::TSInterfaceDeclaration(interface_decl) => {
+                let checker = InterfaceChecker { interface_decl };
+                let found = checker.from_ast(code, filename, false, None);
+                results
+                    .entry(found.name.clone())
+                    .or_insert_with(Vec::new)
+                    .push(found);
+            }
+            Statement::ClassDeclaration(class) => {
+                for imp in &class.implements {
+                    if let TSTypeName::IdentifierReference(id) = &imp.expression {
+                        *impl_counts.entry(id.name.to_string()).or_insert(0) += 1;
+                    }
+                }
+            }
             Statement::ExportNamedDeclaration(export) => {
-                if let Some(Declaration::TSTypeAliasDeclaration(type_alias)) = &export.declaration {
-                    let found =
-                        FoundType::from_ast(type_alias, code, filename, true, Some(export.span));
-                    results
-                        .entry(found.name.clone())
-                        .or_insert_with(Vec::new)
-                        .push(found);
+                if let Some(decl) = &export.declaration {
+                    match decl {
+                        Declaration::TSTypeAliasDeclaration(type_alias) => {
+                            let checker = TypeChecker { type_alias };
+                            let found = checker.from_ast(code, filename, true, Some(export.span));
+                            results
+                                .entry(found.name.clone())
+                                .or_insert_with(Vec::new)
+                                .push(found);
+                        }
+                        Declaration::TSInterfaceDeclaration(interface_decl) => {
+                            let checker = InterfaceChecker { interface_decl };
+                            let found = checker.from_ast(code, filename, true, Some(export.span));
+                            results
+                                .entry(found.name.clone())
+                                .or_insert_with(Vec::new)
+                                .push(found);
+                        }
+                        Declaration::ClassDeclaration(class) => {
+                            for imp in &class.implements {
+                                if let TSTypeName::IdentifierReference(id) = &imp.expression {
+                                    *impl_counts.entry(id.name.to_string()).or_insert(0) += 1;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
             _ => {}
@@ -127,7 +169,8 @@ fn main() {
     let target_path = args.path.unwrap_or_else(|| ".".to_string());
     let paths = find_ts_files(Path::new(&target_path));
 
-    let mut results: HashMap<String, Vec<FoundType>> = HashMap::new();
+    let mut results: HashMap<String, Vec<FoundDeclarationNode>> = HashMap::new();
+    let mut impl_counts: HashMap<String, usize> = HashMap::new();
     let mut source_cache = FileCache::new();
 
     let pb = ProgressBar::new(paths.len() as u64);
@@ -141,12 +184,12 @@ fn main() {
     for path in &paths {
         let code = std::fs::read_to_string(path).expect("Failed to read source file");
         source_cache.insert(path.clone(), code.clone());
-        parse_ts_code(&code, path, &mut results, args.verbose);
+        parse_ts_code(&code, path, &mut results, &mut impl_counts, args.verbose);
         pb.inc(1);
     }
     pb.finish_and_clear();
 
-    eprintln!("Found {} unique TS type names.\n", results.len());
+    eprintln!("Found {} unique TS type/interface names.\n", results.len());
 
     let mut warning_count: usize = 0;
     let mut critical_count: usize = 0;
@@ -167,16 +210,25 @@ fn main() {
                     continue;
                 }
 
+                let kind_label = match (&type_a.ast_node_variant, &type_b.ast_node_variant) {
+                    (shared_lib::AstNodeVariant::Type, shared_lib::AstNodeVariant::Type) => "type",
+                    (
+                        shared_lib::AstNodeVariant::Interface,
+                        shared_lib::AstNodeVariant::Interface,
+                    ) => "interface",
+                    _ => "declaration",
+                };
+
                 if is_critical {
                     critical_count += 1;
 
-                    Report::build(
+                    let mut report = Report::build(
                         ReportKind::Error,
                         (type_a.filename.clone(), type_a.span_start..type_a.span_end),
                     )
                     .with_message(format!(
-                        "Duplicate type '{}' with identical body",
-                        type_name
+                        "Duplicate {} '{}' with identical body",
+                        kind_label, type_name
                     ))
                     .with_label(
                         Label::new((type_a.filename.clone(), type_a.span_start..type_a.span_end))
@@ -188,20 +240,32 @@ fn main() {
                             .with_message("also defined here with the same body")
                             .with_color(Color::Red),
                     )
-                    .with_note("Consider merging into a single shared type definition.")
-                    .finish()
-                    .eprint(&source_cache)
-                    .unwrap();
+                    .with_note(format!(
+                        "Consider merging into a single shared {} definition.",
+                        kind_label
+                    ));
+
+                    if kind_label == "interface" {
+                        let count = impl_counts.get(type_name.as_str()).copied().unwrap_or(0);
+                        report = report.with_help(format!(
+                            "Found {} class implementation{} of '{}'.",
+                            count,
+                            if count == 1 { "" } else { "s" },
+                            type_name
+                        ));
+                    }
+
+                    report.finish().eprint(&source_cache).unwrap();
                 } else {
                     warning_count += 1;
 
-                    Report::build(
+                    let mut report = Report::build(
                         ReportKind::Warning,
                         (type_a.filename.clone(), type_a.span_start..type_a.span_end),
                     )
                     .with_message(format!(
-                        "Duplicate type name '{}' with different body",
-                        type_name
+                        "Duplicate {} name '{}' with different body",
+                        kind_label, type_name
                     ))
                     .with_label(
                         Label::new((type_a.filename.clone(), type_a.span_start..type_a.span_end))
@@ -213,12 +277,22 @@ fn main() {
                             .with_message("also defined here with a different body")
                             .with_color(Color::Yellow),
                     )
-                    .with_help(
-                        "These types share a name but differ in structure. Consider renaming one.",
-                    )
-                    .finish()
-                    .eprint(&source_cache)
-                    .unwrap();
+                    .with_help(format!(
+                        "These {}s share a name but differ in structure. Consider renaming one.",
+                        kind_label
+                    ));
+
+                    if kind_label == "interface" {
+                        let count = impl_counts.get(type_name.as_str()).copied().unwrap_or(0);
+                        report = report.with_note(format!(
+                            "Found {} class implementation{} of '{}'.",
+                            count,
+                            if count == 1 { "" } else { "s" },
+                            type_name
+                        ));
+                    }
+
+                    report.finish().eprint(&source_cache).unwrap();
                 }
             }
         }
@@ -226,4 +300,93 @@ fn main() {
 
     eprintln!("\nWarnings: {}", warning_count);
     eprintln!("Critical: {}", critical_count);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_impl_count_single_class() {
+        let code = r#"
+            interface IFoo { x: string; }
+            class Bar implements IFoo { x = "hi"; }
+        "#;
+        let mut results = HashMap::new();
+        let mut impl_counts = HashMap::new();
+        parse_ts_code(code, "test.ts", &mut results, &mut impl_counts, false);
+        assert_eq!(impl_counts.get("IFoo").copied().unwrap_or(0), 1);
+    }
+
+    #[test]
+    fn test_impl_count_multiple_classes() {
+        let code = r#"
+            interface IFoo { x: string; }
+            class A implements IFoo { x = "a"; }
+            class B implements IFoo { x = "b"; }
+            class C implements IFoo { x = "c"; }
+        "#;
+        let mut results = HashMap::new();
+        let mut impl_counts = HashMap::new();
+        parse_ts_code(code, "test.ts", &mut results, &mut impl_counts, false);
+        assert_eq!(impl_counts.get("IFoo").copied().unwrap_or(0), 3);
+    }
+
+    #[test]
+    fn test_impl_count_no_implementations() {
+        let code = r#"
+            interface IFoo { x: string; }
+        "#;
+        let mut results = HashMap::new();
+        let mut impl_counts = HashMap::new();
+        parse_ts_code(code, "test.ts", &mut results, &mut impl_counts, false);
+        assert_eq!(impl_counts.get("IFoo").copied().unwrap_or(0), 0);
+    }
+
+    #[test]
+    fn test_impl_count_exported_class() {
+        let code = r#"
+            interface IFoo { x: string; }
+            export class Bar implements IFoo { x = "hi"; }
+        "#;
+        let mut results = HashMap::new();
+        let mut impl_counts = HashMap::new();
+        parse_ts_code(code, "test.ts", &mut results, &mut impl_counts, false);
+        assert_eq!(impl_counts.get("IFoo").copied().unwrap_or(0), 1);
+    }
+
+    #[test]
+    fn test_impl_count_multiple_interfaces() {
+        let code = r#"
+            interface IFoo { x: string; }
+            interface IBar { y: number; }
+            class A implements IFoo { x = "a"; }
+            class B implements IBar { y = 1; }
+            class C implements IFoo { x = "c"; }
+        "#;
+        let mut results = HashMap::new();
+        let mut impl_counts = HashMap::new();
+        parse_ts_code(code, "test.ts", &mut results, &mut impl_counts, false);
+        assert_eq!(impl_counts.get("IFoo").copied().unwrap_or(0), 2);
+        assert_eq!(impl_counts.get("IBar").copied().unwrap_or(0), 1);
+    }
+
+    #[test]
+    fn test_impl_count_accumulates_across_files() {
+        let mut results = HashMap::new();
+        let mut impl_counts = HashMap::new();
+
+        let code1 = r#"
+            interface IFoo { x: string; }
+            class A implements IFoo { x = "a"; }
+        "#;
+        parse_ts_code(code1, "file1.ts", &mut results, &mut impl_counts, false);
+
+        let code2 = r#"
+            class B implements IFoo { x = "b"; }
+        "#;
+        parse_ts_code(code2, "file2.ts", &mut results, &mut impl_counts, false);
+
+        assert_eq!(impl_counts.get("IFoo").copied().unwrap_or(0), 2);
+    }
 }

@@ -1,38 +1,33 @@
-use oxc_ast::ast::{TSType, TSTypeAliasDeclaration};
-use oxc_span::Span;
+use oxc::ast::ast::{TSType, TSTypeAliasDeclaration};
+use oxc::span::Span;
 
-#[derive(Debug, Clone)]
-pub struct FoundType {
-    pub name: String,
-    pub filename: String,
-    pub line: usize,
-    pub col: usize,
-    pub span_start: usize,
-    pub span_end: usize,
-    pub is_exported: bool,
-    pub body: String,
+use crate::shared_lib::{
+    byte_offset_to_line_col, AstNodeVariant, DeclarationChecker, FoundDeclarationNode,
+};
+
+pub struct TypeChecker<'a> {
+    pub type_alias: &'a TSTypeAliasDeclaration<'a>,
 }
 
-impl FoundType {
-    pub fn from_ast(
-        type_alias: &TSTypeAliasDeclaration,
+impl<'a> DeclarationChecker for TypeChecker<'a> {
+    fn from_ast(
+        &self,
         source: &str,
         filename: &str,
         is_exported: bool,
         override_span: Option<Span>,
-    ) -> Self {
-        let name = type_alias.id.name.to_string();
+    ) -> FoundDeclarationNode {
+        let name = self.type_alias.id.name.to_string();
 
-        let span = override_span.unwrap_or(type_alias.span);
+        let span = override_span.unwrap_or(self.type_alias.span);
         let start = span.start as usize;
         let end = span.end as usize;
 
-        // Calculate line/col from byte offset
         let (line, col) = byte_offset_to_line_col(source, start);
+        let body = serialize_ts_type(&self.type_alias.type_annotation);
 
-        let body = serialize_ts_type(&type_alias.type_annotation);
-
-        Self {
+        FoundDeclarationNode {
+            ast_node_variant: AstNodeVariant::Type,
             name,
             body,
             filename: filename.to_string(),
@@ -45,24 +40,7 @@ impl FoundType {
     }
 }
 
-fn byte_offset_to_line_col(source: &str, offset: usize) -> (usize, usize) {
-    let mut line = 1;
-    let mut col = 1;
-    for (i, ch) in source.char_indices() {
-        if i >= offset {
-            break;
-        }
-        if ch == '\n' {
-            line += 1;
-            col = 1;
-        } else {
-            col += 1;
-        }
-    }
-    (line, col)
-}
-
-fn serialize_ts_type(ts_type: &TSType) -> String {
+pub fn serialize_ts_type(ts_type: &TSType) -> String {
     match ts_type {
         TSType::TSAnyKeyword(_) => "any".to_string(),
         TSType::TSBooleanKeyword(_) => "boolean".to_string(),
@@ -148,5 +126,100 @@ fn serialize_ts_type(ts_type: &TSType) -> String {
         TSType::JSDocNonNullableType(n) => format!("!{}", serialize_ts_type(&n.type_annotation)),
         TSType::JSDocUnknownType(_) => "unknown(jsdoc)".to_string(),
         TSType::TSTypePredicate(p) => format!("TypePredicate({:?})", p.parameter_name),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shared_lib::AstNodeVariant;
+    use oxc::allocator::Allocator;
+    use oxc::ast::ast::{Declaration, Statement};
+    use oxc::parser::Parser as OxcParser;
+    use oxc::span::SourceType;
+
+    fn parse_type(source: &str) -> FoundDeclarationNode {
+        let allocator = Allocator::default();
+        let source_type = SourceType::ts();
+        let ret = OxcParser::new(&allocator, source, source_type).parse();
+        for stmt in &ret.program.body {
+            if let Statement::TSTypeAliasDeclaration(type_alias) = stmt {
+                let checker = TypeChecker { type_alias };
+                return checker.from_ast(source, "test.ts", false, None);
+            }
+            if let Statement::ExportNamedDeclaration(export) = stmt {
+                if let Some(Declaration::TSTypeAliasDeclaration(type_alias)) = &export.declaration {
+                    let checker = TypeChecker { type_alias };
+                    return checker.from_ast(source, "test.ts", true, Some(export.span));
+                }
+            }
+        }
+        panic!("No type alias found in source");
+    }
+
+    #[test]
+    fn test_type_checker_name_and_variant() {
+        let node = parse_type("type Foo = string;");
+        assert_eq!(node.name, "Foo");
+        assert!(matches!(node.ast_node_variant, AstNodeVariant::Type));
+    }
+
+    #[test]
+    fn test_type_checker_body_simple() {
+        let node = parse_type("type Foo = string;");
+        assert_eq!(node.body, "string");
+    }
+
+    #[test]
+    fn test_type_checker_body_union() {
+        let node = parse_type("type Foo = string | number;");
+        assert_eq!(node.body, "string | number");
+    }
+
+    #[test]
+    fn test_type_checker_not_exported() {
+        let node = parse_type("type Foo = string;");
+        assert!(!node.is_exported);
+    }
+
+    #[test]
+    fn test_type_checker_exported() {
+        let node = parse_type("export type Foo = string;");
+        assert!(node.is_exported);
+    }
+
+    #[test]
+    fn test_type_checker_identical_bodies_match() {
+        let a = parse_type("type Foo = string;");
+        let b = parse_type("type Foo = string;");
+        assert_eq!(a.body, b.body);
+    }
+
+    #[test]
+    fn test_type_checker_different_bodies_differ() {
+        let a = parse_type("type Foo = string;");
+        let b = parse_type("type Foo = number;");
+        assert_ne!(a.body, b.body);
+    }
+
+    #[test]
+    fn test_type_checker_line_col() {
+        let node = parse_type("type Foo = string;");
+        assert_eq!(node.line, 1);
+        assert_eq!(node.col, 1);
+    }
+
+    #[test]
+    fn test_type_checker_line_col_with_offset() {
+        let source = "\n\ntype Foo = string;";
+        let node = parse_type(source);
+        assert_eq!(node.line, 3);
+        assert_eq!(node.col, 1);
+    }
+
+    #[test]
+    fn test_type_checker_filename() {
+        let node = parse_type("type Foo = string;");
+        assert_eq!(node.filename, "test.ts");
     }
 }
